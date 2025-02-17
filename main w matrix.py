@@ -1,12 +1,14 @@
 from tkinter import *
 from numpy import *
+import matplotlib.pyplot as plt
 
 # matplotlib 3D
 
 class Point():
-    def __init__(self, x, y, condition, connected = None, index = 0):
+    def __init__(self, x, y, z, condition, connected = None, index = 0):
         self.x = x
         self.y = y
+        self.z = z
         self.condition = condition # free, fixed
         self.connected = set() if connected is None else connected
 
@@ -26,19 +28,23 @@ class Point():
     def interpolate(self, end, resolution, num_pts):
         dx = (end.x - self.x)/resolution
         dy = (end.y - self.y)/resolution
+        dz = (end.z - self.z)/resolution
 
         ans = []
 
         for i in range(1, resolution):
-            ans.append(Point(self.x + i * dx, self.y + i * dy, "free", index = num_pts + i - 1))
+            ans.append(Point(self.x + i * dx, self.y + i * dy, self.z + i * dz, "free", index = num_pts + i - 1))
 
         return ans
     
     def distance(self, p2):
+        return ((self.x - p2.x) ** 2 + (self.y - p2.y) ** 2 + (self.z - p2.z) ** 2) ** 0.5
+    
+    def plane_distance(self, p2):
         return ((self.x - p2.x) ** 2 + (self.y - p2.y) ** 2) ** 0.5
     
     def __repr__(self):
-        return f"{self.index}: ({self.x:0.0f}, {self.y:0.0f}) -> {[point.index for point in self.connected]}"
+        return f"{self.index}: ({self.x:0.0f}, {self.y:0.0f}, {self.z:0.0f}) -> {[point.index for point in self.connected]}"
 
 class ScreenSpace(Frame):
     def __init__(self):
@@ -70,7 +76,7 @@ class ScreenSpace(Frame):
         for point in self.points:
             self.canvas.create_oval(point.x - point.radius, point.y - point.radius,
                                     point.x + point.radius, point.y + point.radius,
-                                    outline = "#fff", fill = "#fff", width = 0)
+                                    outline = "#fff", fill = "#fff", width = point.z/2)
             # draw dots at all the points in self.points
 
             for other in point.connected:
@@ -78,16 +84,32 @@ class ScreenSpace(Frame):
                                         other.x, other.y,
                                         fill = '#fff',
                                         width = 0.5)
+                                        
+    def plot(self, event):
+        print("plotting")
+
+        xs = [point.x for point in self.points]
+        ys = [point.y for point in self.points]
+        zs = [point.z for point in self.points]
+
+        fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
+        ax.scatter(xs, ys, zs)
+
+        ax.set(xticklabels=[],
+            yticklabels=[],
+            zticklabels=[])
+
+        plt.show()
                 
     def snap(self, event):
-        event_pt = Point(event.x, event.y, "fixed", index = len(self.points))
+        event_pt = Point(event.x, event.y, 0, "fixed", index = len(self.points))
 
         min_dist = float("inf")
         min_pt = None
 
         if self.points:
             for point in self.points:
-                dist = point.distance(event_pt)
+                dist = point.plane_distance(event_pt)
                 if dist < min_dist:
                     min_dist = dist
                     min_pt = point
@@ -103,7 +125,7 @@ class ScreenSpace(Frame):
     def add_chain(self, event):
         startpt = self.last_added
         endpt = self.snap(event)
-        midpts = startpt.interpolate(endpt, 30, len(self.points))
+        midpts = startpt.interpolate(endpt, 10, len(self.points))
 
         chain_pts = [startpt, *midpts, endpt]
         for i, point in enumerate(chain_pts):
@@ -146,8 +168,8 @@ class FDMModel():
         self.fixed = []
         self.free = []
 
-        x_fixed = [[], []]
-        x_free = [[], []]
+        x_fixed = [[], [], []]
+        x_free = [[], [], []]
 
         for i, startpt in enumerate(points):
             for endpt in startpt.connected:
@@ -160,10 +182,12 @@ class FDMModel():
                 self.free.append(i)
                 x_free[0].append(startpt.x)
                 x_free[1].append(startpt.y)
+                x_free[2].append(startpt.z)
             else:
                 self.fixed.append(i)
                 x_fixed[0].append(startpt.x)
                 x_fixed[1].append(startpt.y)
+                x_fixed[2].append(startpt.z)
 
         C = C[1:, :] # connectivity matrix
 
@@ -171,7 +195,7 @@ class FDMModel():
         C_free = C[:, self.free]
 
         Q = diag([q]*C_free.shape[0])
-        p = array([[0, 9.8] for i in range(len(self.free))])
+        p = array([[0, 0, 9.8] for i in range(len(self.free))])
 
         Dn = C_free.T @ Q @ C_free
         Df = C_free.T @ Q @ C_fixed
@@ -186,8 +210,7 @@ class FDMModel():
             point = points[point_ind]
             point.x = self.new_x[i, 0]
             point.y = self.new_x[i, 1]
-
-
+            point.z = self.new_x[i, 2]
 
 
 root = Tk()
@@ -202,6 +225,7 @@ root.bind("<KeyPress-p>", ex.dump)
 root.bind("<KeyPress-l>", ex.add_labels)
 root.bind("<Command-KeyPress-l>", ex.clear_labels)
 root.bind("<Command-KeyPress-c>", ex.create_model)
+root.bind("<Command-KeyPress-p>", ex.plot)
 
 while True:
     ex.draw()
