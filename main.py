@@ -1,5 +1,9 @@
 from tkinter import *
 
+# comment
+
+# another comment
+
 class Point():
     def __init__(self, x, y, condition):
         self.x = x

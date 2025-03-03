@@ -2,8 +2,6 @@ from tkinter import *
 from numpy import *
 import matplotlib.pyplot as plt
 
-# matplotlib 3D
-
 class Point():
     def __init__(self, x, y, z, condition, connected = None, index = 0):
         self.x = x
