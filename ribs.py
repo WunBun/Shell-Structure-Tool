@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 
 from meshlib import mrmeshpy as mm
 from meshlib import mrmeshnumpy as mn
+import meshlib.mrmeshpy as mrmeshpy
 
 import plotly.graph_objects as go
 
@@ -48,6 +49,9 @@ class Point():
     
     def __repr__(self):
         return f"{self.index}: ({self.x:0.0f}, {self.y:0.0f}, {self.z:0.0f}) -> {[point.index for point in self.connected]}"
+    
+    # def __eq__(self, other):
+    #     return self.distance(other) < 10e-3
 
 class Line():
     def __init__(self, pstart, pend):
@@ -122,19 +126,6 @@ class ScreenSpace(Frame):
         print("plotting")
 
         self.model.plot()
-
-        # xs = [point.x for point in self.points]
-        # ys = [point.y for point in self.points]
-        # zs = [point.z for point in self.points]
-
-        # fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
-        # ax.scatter(xs, ys, zs)
-
-        # ax.set(xticklabels=[],
-        #     yticklabels=[],
-        #     zticklabels=[])
-
-        # plt.show()
                 
     def snap(self, event):
         event_pt = Point(event.x, event.y, 0, "fixed", index = len(self.points))
@@ -228,16 +219,25 @@ class ScreenSpace(Frame):
             tx = Label(text = f"{point.index}", font=("Ariel", 10, "italic"), fg = "white")
             tx.place(x = point.x, y = point.y)
 
-    def create_model(self, event):
+    def create_mesh(self, event):
         # model = FDMModel(self.points)
         # model.update(self.points)
 
         self.model = FDMMesh(self.points, self.lines)
 
+    def simulate_model(self, event):
+        self.model.create_FDMModel()
+
+    def update_model(self, event):
+        self.model.update()
+
 class FDMMesh():
     def __init__(self, points = None, lines = None):
         if not points or not lines:
             return
+        
+        self.base_points = points
+        self.ribs = lines
 
         self.verts = np.array(
             [
@@ -246,8 +246,6 @@ class FDMMesh():
                 np.array([float(point.z) for point in points])
             ]
         ).T
-
-        print(self.verts)
 
         # Create MeshLib PointCloud from np ndarray
         self.pc = mn.pointCloudFromPoints(self.verts)
@@ -260,7 +258,13 @@ class FDMMesh():
 
         # Triangulate it
         self.tri = mm.triangulatePointCloud(self.pc)
-        
+
+        props = mrmeshpy.SubdivideSettings()
+        props.maxDeviationAfterFlip = 0.5
+        props.maxEdgeSplits = 500
+        mrmeshpy.subdivideMesh(self.tri, props)
+
+        self.verts = mn.getNumpyVerts(self.tri)
         self.faces = mn.getNumpyFaces(self.tri.topology)
         
         # # Fix possible issues
@@ -271,28 +275,138 @@ class FDMMesh():
     def plot(self):
         print("plotting")
 
-        print(self.faces)
-
         fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
-        ax.scatter(
-            xs = [v[0] for v in self.verts],
-            ys = [v[1] for v in self.verts],
-            zs = [v[2] for v in self.verts]
-        )
+        # ax.scatter(
+        #     xs = [v[0] for v in self.verts],
+        #     ys = [v[1] for v in self.verts],
+        #     zs = [v[2] for v in self.verts]
+        # )
 
         ax.set(xticklabels=[],
             yticklabels=[],
             zticklabels=[])
         
-        for face in self.faces:
-            for i in range(3):
+        if not self.free_edges:
+            for face in self.faces:
+                for i in range(3):
+                    ax.plot(
+                        [self.verts[face[i]][0], self.verts[face[(i + 1)%3]][0]],
+                        [self.verts[face[i]][1], self.verts[face[(i + 1)%3]][1]],
+                        [self.verts[face[i]][2], self.verts[face[(i + 1)%3]][2]],
+                    )
+        else:
+            for edge in self.free_edges:
                 ax.plot(
-                    [self.verts[face[i]][0], self.verts[face[(i + 1)%3]][0]],
-                    [self.verts[face[i]][1], self.verts[face[(i + 1)%3]][1]],
-                    [self.verts[face[i]][2], self.verts[face[(i + 1)%3]][2]],
-                )
+                        [self.verts[edge[0]][0], self.verts[edge[1]][0]],
+                        [self.verts[edge[0]][1], self.verts[edge[1]][1]],
+                        [self.verts[edge[0]][2], self.verts[edge[1]][2]],
+                        "g-",
+                        linewidth = 0.5
+                    )
+            for edge in self.rib_edges:
+                ax.plot(
+                        [self.verts[edge[0]][0], self.verts[edge[1]][0]],
+                        [self.verts[edge[0]][1], self.verts[edge[1]][1]],
+                        [self.verts[edge[0]][2], self.verts[edge[1]][2]],
+                        "k-",
+                        linewidth = 1
+                    )
 
         plt.show()
+
+    def create_FDMModel(self):
+        # force densities
+        q_gen = 50
+        q_rib = 500
+
+        orig_fixed = [p for p in self.base_points if p.condition == "fixed"]
+        orig_free = [p for p in self.base_points if p.condition == "free"]
+
+        # Create matrixes of fixed and free points and determine their indices
+
+        x = np.array(self.verts)
+        x_fixed = np.empty((0, 3))
+        x_free = np.empty((0, 3))
+
+        fixed_ind = []
+        self.fixed_ind = fixed_ind
+        free_ind = []
+        self.free_ind = free_ind
+
+        for i, vert in enumerate(self.verts):
+            vert_pt = Point(vert[0], vert[1], vert[2])
+            if min(vert_pt.distance(p) for p in orig_fixed) < 10e-3:
+                x_fixed = np.vstack((x_fixed, np.array(vert)))
+                fixed_ind.append(i)
+            else:
+                x_free = np.vstack((x_free, np.array(vert)))
+                free_ind.append(i)
+
+        # Create the connectivity matrix and list of force densities corresponding to each edge
+
+        self.rib_edges = set()
+        self.free_edges = set()
+        qs = []
+        C = np.zeros((0, len(fixed_ind + free_ind)))
+
+        for face in self.faces:
+            for i in range(3):
+                edge_start = x[face[i], :]
+                edge_end = x[face[(i+1) % 3], :]
+
+                edge_mid = (edge_start + edge_end) / 2
+
+                # skip repeat edges
+                if (face[i], face[(i+1) % 3]) in self.rib_edges or (face[(i+1) % 3], face[i]) in self.rib_edges:
+                    print("repeat")
+                    continue
+
+                if (face[i], face[(i+1) % 3]) in self.free_edges or (face[(i+1) % 3], face[i]) in self.free_edges:
+                    print("repeat")
+                    continue
+
+                # if the edge midpoint is on one of the original edges before subdivision
+                # then it's a rib edge
+
+                print(min(l.distance_2d(Point(edge_mid[0], edge_mid[1], edge_mid[2]))[1] for l in self.ribs))
+
+                if min(l.distance_2d(Point(edge_mid[0], edge_mid[1], edge_mid[2]))[1] for l in self.ribs) < 10e-1:
+                    qs.append(q_rib)
+                    self.rib_edges.add((face[i], face[(i+1) % 3]))
+                    print("rib")
+                else:
+                    qs.append(q_gen)
+                    self.free_edges.add((face[i], face[(i+1) % 3]))
+
+                # create a new row in the connectivity matrix
+                newrow = np.zeros((1, len(fixed_ind + free_ind)))
+                newrow[0, face[i]] = 1
+                newrow[0, face[(i+1) % 3]] = -1
+                C = np.vstack([C, newrow])
+
+        # solve FDM
+
+        Q = np.diag(qs)
+        print(Q)
+        
+        C_fixed = C[:, fixed_ind]
+        C_free = C[:, free_ind]
+
+        p = np.array([[0, 0, -9.8] for i in range(len(free_ind))])
+
+        Dn = C_free.T @ Q @ C_free
+        Df = C_free.T @ Q @ C_fixed
+
+        self.new_x = np.linalg.solve(Dn, p - Df @ x_fixed)
+
+        print(self.new_x)
+
+    def update(self):
+        for i, ind in enumerate(self.free_ind):
+            self.verts[ind, :] = self.new_x[i, :]
+
+
+
 
 
 
@@ -358,7 +472,9 @@ root.bind("<Command-KeyPress-d>", ex.clear)
 root.bind("<KeyPress-p>", ex.dump)
 root.bind("<KeyPress-l>", ex.add_labels)
 root.bind("<Command-KeyPress-l>", ex.clear_labels)
-root.bind("<Command-KeyPress-c>", ex.create_model)
+root.bind("<Command-KeyPress-c>", ex.create_mesh)
+root.bind("<Command-KeyPress-s>", ex.simulate_model)
+root.bind("<Command-KeyPress-u>", ex.update_model)
 root.bind("<Command-KeyPress-p>", ex.plot)
 
 while True:
