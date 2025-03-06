@@ -1,6 +1,8 @@
 from tkinter import *
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from meshlib import mrmeshpy as mm
 from meshlib import mrmeshnumpy as mn
@@ -101,6 +103,7 @@ class ScreenSpace(Frame):
 
     def clear(self, event):
         self.points = [] # empty out the objects
+        self.lines = []
         self.last_added = None
 
         self.canvas.delete("all")
@@ -233,6 +236,8 @@ class ScreenSpace(Frame):
 
 class FDMMesh():
     def __init__(self, points = None, lines = None):
+        self.epsilon = 10e-2
+
         if not points or not lines:
             return
         
@@ -260,7 +265,17 @@ class FDMMesh():
         self.tri = mm.triangulatePointCloud(self.pc)
 
         props = mrmeshpy.SubdivideSettings()
-        props.maxDeviationAfterFlip = 0.5
+        props.maxDeviationAfterFlip = 0
+        props.maxAngleChangeAfterFlip = 0
+
+        no_flip = mm.UndirectedEdgeBitSet(
+            mm.BitSet(
+                self.count_edges(mn.getNumpyFaces(self.tri.topology)),
+                True
+            )
+        )
+        props.notFlippable = no_flip
+        # props.criticalAspectRatioFlip = 1.0
         props.maxEdgeSplits = 500
         mrmeshpy.subdivideMesh(self.tri, props)
 
@@ -272,19 +287,66 @@ class FDMMesh():
         # offsetParams.voxelSize = mm.suggestVoxelSize(self.tri, 5e6)
         # self.tri = mm.offsetMesh(self.tri, 0.0, params=offsetParams)
 
+        self.free_edges = None
+        self.rib_edges = None
+
+    def count_edges(self, faces, list_edges = False):
+        edges = set()
+
+        for face in faces:
+            for i in range(3):
+                if (face[i], face[(i + 1) % 3]) not in edges and (face[(i + 1) % 3], face[i]) not in edges:
+                    edges.add((face[i], face[(i + 1) % 3]))
+
+        if list_edges:
+            return edges, len(edges)
+        
+        return len(edges)
+
     def plot(self):
         print("plotting")
 
-        fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
-        # ax.scatter(
-        #     xs = [v[0] for v in self.verts],
-        #     ys = [v[1] for v in self.verts],
-        #     zs = [v[2] for v in self.verts]
-        # )
+        fig, ax = plt.subplots(subplot_kw={"projection": "3d", "autoscale_on": "True"})
 
-        ax.set(xticklabels=[],
+        ax.grid(False)
+
+        ax.set_box_aspect((
+            np.ptp(self.verts[:, 0]),
+            np.ptp(self.verts[:, 1]),
+            np.ptp(self.verts[:, 2]) if np.ptp(self.verts[:, 2]) > 0 else np.ptp(self.verts[:, 1])))
+
+        ax.set(
+            xticklabels=[],
             yticklabels=[],
-            zticklabels=[])
+            zticklabels=[]
+            )
+        
+        ax.view_init(elev=-30, azim=45, roll=180)
+        mpl.rcParams['axes3d.mouserotationstyle'] = 'azel'
+
+        face_polys = np.array(
+            [
+                [
+                    self.verts[face[0]],
+                    self.verts[face[1]],
+                    self.verts[face[2]],
+                    self.verts[face[0]]
+                ]
+                for face in self.faces
+            ]
+        )
+        
+        poly = Poly3DCollection(
+            face_polys,
+            alpha = 0.7,
+            shade = True,
+            facecolors = "xkcd:light green",
+            # zorder = 0
+            # lightsource
+            )
+        
+        ax.add_collection3d(poly)
+
         
         if not self.free_edges:
             for face in self.faces:
@@ -293,6 +355,7 @@ class FDMMesh():
                         [self.verts[face[i]][0], self.verts[face[(i + 1)%3]][0]],
                         [self.verts[face[i]][1], self.verts[face[(i + 1)%3]][1]],
                         [self.verts[face[i]][2], self.verts[face[(i + 1)%3]][2]],
+                        # zorder = 1
                     )
         else:
             for edge in self.free_edges:
@@ -301,7 +364,8 @@ class FDMMesh():
                         [self.verts[edge[0]][1], self.verts[edge[1]][1]],
                         [self.verts[edge[0]][2], self.verts[edge[1]][2]],
                         "g-",
-                        linewidth = 0.5
+                        linewidth = 0.5,
+                        # zorder = 2
                     )
             for edge in self.rib_edges:
                 ax.plot(
@@ -309,15 +373,16 @@ class FDMMesh():
                         [self.verts[edge[0]][1], self.verts[edge[1]][1]],
                         [self.verts[edge[0]][2], self.verts[edge[1]][2]],
                         "k-",
-                        linewidth = 1
+                        linewidth = 1,
+                        # zorder = 3
                     )
 
         plt.show()
 
     def create_FDMModel(self):
         # force densities
-        q_gen = 50
-        q_rib = 500
+        q_gen = 2
+        q_rib = 40
 
         orig_fixed = [p for p in self.base_points if p.condition == "fixed"]
         orig_free = [p for p in self.base_points if p.condition == "free"]
@@ -335,7 +400,7 @@ class FDMMesh():
 
         for i, vert in enumerate(self.verts):
             vert_pt = Point(vert[0], vert[1], vert[2])
-            if min(vert_pt.distance(p) for p in orig_fixed) < 10e-3:
+            if min(vert_pt.distance(p) for p in orig_fixed) < self.epsilon:
                 x_fixed = np.vstack((x_fixed, np.array(vert)))
                 fixed_ind.append(i)
             else:
@@ -354,26 +419,16 @@ class FDMMesh():
                 edge_start = x[face[i], :]
                 edge_end = x[face[(i+1) % 3], :]
 
-                edge_mid = (edge_start + edge_end) / 2
-
                 # skip repeat edges
                 if (face[i], face[(i+1) % 3]) in self.rib_edges or (face[(i+1) % 3], face[i]) in self.rib_edges:
-                    print("repeat")
                     continue
 
                 if (face[i], face[(i+1) % 3]) in self.free_edges or (face[(i+1) % 3], face[i]) in self.free_edges:
-                    print("repeat")
                     continue
 
-                # if the edge midpoint is on one of the original edges before subdivision
-                # then it's a rib edge
-
-                print(min(l.distance_2d(Point(edge_mid[0], edge_mid[1], edge_mid[2]))[1] for l in self.ribs))
-
-                if min(l.distance_2d(Point(edge_mid[0], edge_mid[1], edge_mid[2]))[1] for l in self.ribs) < 10e-1:
+                if self.is_rib(edge_start, edge_end):
                     qs.append(q_rib)
                     self.rib_edges.add((face[i], face[(i+1) % 3]))
-                    print("rib")
                 else:
                     qs.append(q_gen)
                     self.free_edges.add((face[i], face[(i+1) % 3]))
@@ -401,14 +456,29 @@ class FDMMesh():
 
         print(self.new_x)
 
+    def is_rib(self, edge_start, edge_end):
+        edge_mid = (edge_start + edge_end) / 2
+
+        for rib in self.ribs:
+            dot_prod = (
+                (edge_mid[0] - rib.pstart.x) * (rib.pend.x - rib.pstart.x) +
+                (edge_mid[1] - rib.pstart.y) * (rib.pend.y - rib.pstart.y) +
+                (edge_mid[2] - rib.pstart.z) * (rib.pend.z - rib.pstart.z)
+            )
+
+            if (rib.distance_2d(Point(edge_mid[0], edge_mid[1], edge_mid[2]))[1] < self.epsilon
+                and
+                dot_prod >= 0
+                and
+                dot_prod <= rib.pstart.distance(rib.pend) ** 2
+            ):
+                return True
+            
+        return False
+
     def update(self):
         for i, ind in enumerate(self.free_ind):
             self.verts[ind, :] = self.new_x[i, :]
-
-
-
-
-
 
 class FDMModel():
     def __init__(self, points, q = 10):
