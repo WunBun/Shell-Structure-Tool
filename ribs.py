@@ -8,7 +8,7 @@ from meshlib import mrmeshpy as mm
 from meshlib import mrmeshnumpy as mn
 import meshlib.mrmeshpy as mrmeshpy
 
-import plotly.graph_objects as go
+import scipy.optimize as opt
 
 class Point():
     def __init__(self, x, y, z, condition = "free", connected = None, index = 0):
@@ -97,7 +97,7 @@ class ScreenSpace(Frame):
 
         self.last_added = None
 
-        self.epsilon = 10
+        self.epsilon = 5
 
         self.model = FDMMesh()
 
@@ -124,11 +124,6 @@ class ScreenSpace(Frame):
                                         other.x, other.y,
                                         fill = '#fff',
                                         width = 0.5)
-                                        
-    def plot(self, event):
-        print("plotting")
-
-        self.model.plot()
                 
     def snap(self, event):
         event_pt = Point(event.x, event.y, 0, "fixed", index = len(self.points))
@@ -223,9 +218,6 @@ class ScreenSpace(Frame):
             tx.place(x = point.x, y = point.y)
 
     def create_mesh(self, event):
-        # model = FDMModel(self.points)
-        # model.update(self.points)
-
         self.model = FDMMesh(self.points, self.lines)
 
     def simulate_model(self, event):
@@ -233,6 +225,18 @@ class ScreenSpace(Frame):
 
     def update_model(self, event):
         self.model.update()
+
+    def csu(self, event):
+        self.model = FDMMesh(self.points, self.lines)
+        self.model.solve_FDMModel()
+        self.model.update()
+
+    def opt_q(self, event):
+        self.model = FDMMesh(self.points, self.lines)
+        self.model.create_q_optimized_model()
+
+    def plot(self, event):
+        self.model.plot()
 
 class FDMMesh():
     def __init__(self, points = None, lines = None):
@@ -275,20 +279,17 @@ class FDMMesh():
             )
         )
         props.notFlippable = no_flip
-        # props.criticalAspectRatioFlip = 1.0
         props.maxEdgeSplits = 500
         mrmeshpy.subdivideMesh(self.tri, props)
 
-        self.verts = mn.getNumpyVerts(self.tri)
-        self.faces = mn.getNumpyFaces(self.tri.topology)
-        
-        # # Fix possible issues
-        # offsetParams = mm.OffsetParameters()
-        # offsetParams.voxelSize = mm.suggestVoxelSize(self.tri, 5e6)
-        # self.tri = mm.offsetMesh(self.tri, 0.0, params=offsetParams)
+        self.orig_verts = np.array(mn.getNumpyVerts(self.tri))
+        self.verts = self.orig_verts
+        self.faces = np.array(mn.getNumpyFaces(self.tri.topology))
 
         self.free_edges = None
         self.rib_edges = None
+
+        self.FDM_invariants()
 
     def count_edges(self, faces, list_edges = False):
         edges = set()
@@ -304,8 +305,6 @@ class FDMMesh():
         return len(edges)
 
     def plot(self):
-        print("plotting")
-
         fig, ax = plt.subplots(subplot_kw={"projection": "3d", "autoscale_on": "True"})
 
         ax.grid(False)
@@ -318,7 +317,8 @@ class FDMMesh():
         ax.set(
             xticklabels=[],
             yticklabels=[],
-            zticklabels=[]
+            zticklabels=[],
+            title = f"gen = {self.q_gen:0.2f}, rib = {self.q_rib:0.2f}, FL = {self.sum_FL():0.2f}, \n area = {self.total_area():0.2f}, supports = {self.support_reactions():0.2f}"
             )
         
         ax.view_init(elev=-30, azim=45, roll=180)
@@ -347,7 +347,6 @@ class FDMMesh():
         
         ax.add_collection3d(poly)
 
-        
         if not self.free_edges:
             for face in self.faces:
                 for i in range(3):
@@ -379,45 +378,40 @@ class FDMMesh():
 
         plt.show()
 
-    def create_FDMModel(self):
-        # force densities
-        q_gen = 2
-        q_rib = 40
-
-        orig_fixed = [p for p in self.base_points if p.condition == "fixed"]
-        orig_free = [p for p in self.base_points if p.condition == "free"]
+    def FDM_invariants(self):
+        self.orig_fixed = [p for p in self.base_points if p.condition == "fixed"]
+        self.orig_free = [p for p in self.base_points if p.condition == "free"]
 
         # Create matrixes of fixed and free points and determine their indices
 
-        x = np.array(self.verts)
-        x_fixed = np.empty((0, 3))
-        x_free = np.empty((0, 3))
+        self.x_fixed = np.empty((0, 3))
+        self.x_free = np.empty((0, 3))
 
-        fixed_ind = []
-        self.fixed_ind = fixed_ind
-        free_ind = []
-        self.free_ind = free_ind
+        self.fixed_ind = []
+        self.free_ind = []
 
-        for i, vert in enumerate(self.verts):
+        for i, vert in enumerate(self.orig_verts):
             vert_pt = Point(vert[0], vert[1], vert[2])
-            if min(vert_pt.distance(p) for p in orig_fixed) < self.epsilon:
-                x_fixed = np.vstack((x_fixed, np.array(vert)))
-                fixed_ind.append(i)
+            if min(vert_pt.distance(p) for p in self.orig_fixed) < self.epsilon:
+                self.x_fixed = np.vstack((self.x_fixed, np.array(vert)))
+                self.fixed_ind.append(i)
             else:
-                x_free = np.vstack((x_free, np.array(vert)))
-                free_ind.append(i)
+                self.x_free = np.vstack((self.x_free, np.array(vert)))
+                self.free_ind.append(i)
 
-        # Create the connectivity matrix and list of force densities corresponding to each edge
+        # ribs, free edges, and support edges
 
         self.rib_edges = set()
         self.free_edges = set()
-        qs = []
-        C = np.zeros((0, len(fixed_ind + free_ind)))
+        self.support_edges = set()
+
+        self.C = np.zeros((0, len(self.fixed_ind + self.free_ind)))
+        self.q_types = []
 
         for face in self.faces:
             for i in range(3):
-                edge_start = x[face[i], :]
-                edge_end = x[face[(i+1) % 3], :]
+                edge_start = self.orig_verts[face[i], :]
+                edge_end = self.orig_verts[face[(i+1) % 3], :]
 
                 # skip repeat edges
                 if (face[i], face[(i+1) % 3]) in self.rib_edges or (face[(i+1) % 3], face[i]) in self.rib_edges:
@@ -427,34 +421,48 @@ class FDMMesh():
                     continue
 
                 if self.is_rib(edge_start, edge_end):
-                    qs.append(q_rib)
                     self.rib_edges.add((face[i], face[(i+1) % 3]))
+                    self.q_types.append("rib")
+
+                    if face[i] in self.fixed_ind or face[(i+1) % 3] in self.fixed_ind:
+                        self.support_edges.add(((face[i], face[(i+1) % 3]), "rib"))
                 else:
-                    qs.append(q_gen)
                     self.free_edges.add((face[i], face[(i+1) % 3]))
+                    self.q_types.append("gen")
+
+                    if face[i] in self.fixed_ind or face[(i+1) % 3] in self.fixed_ind:
+                        self.support_edges.add(((face[i], face[(i+1) % 3]), "gen"))
 
                 # create a new row in the connectivity matrix
-                newrow = np.zeros((1, len(fixed_ind + free_ind)))
+                newrow = np.zeros((1, len(self.fixed_ind + self.free_ind)))
                 newrow[0, face[i]] = 1
                 newrow[0, face[(i+1) % 3]] = -1
-                C = np.vstack([C, newrow])
+                self.C = np.vstack([self.C, newrow])
+
+    def solve_FDMModel(self, qs = (2, 40)):
+        # force densities
+        self.q_gen = qs[0]
+        self.q_rib = qs[1]
+
+        x = self.orig_verts
+
+        # Create the list of force densities corresponding to each edge
+
+        qs = [self.q_gen if t == "gen" else self.q_rib for t in self.q_types]
 
         # solve FDM
 
         Q = np.diag(qs)
-        print(Q)
         
-        C_fixed = C[:, fixed_ind]
-        C_free = C[:, free_ind]
+        C_fixed = self.C[:, self.fixed_ind]
+        C_free = self.C[:, self.free_ind]
 
-        p = np.array([[0, 0, -9.8] for i in range(len(free_ind))])
+        p = np.array([[0, 0, -9.8] for i in range(len(self.free_ind))])
 
         Dn = C_free.T @ Q @ C_free
         Df = C_free.T @ Q @ C_fixed
 
-        self.new_x = np.linalg.solve(Dn, p - Df @ x_fixed)
-
-        print(self.new_x)
+        self.new_x = np.linalg.solve(Dn, p - Df @ self.x_fixed)
 
     def is_rib(self, edge_start, edge_end):
         edge_mid = (edge_start + edge_end) / 2
@@ -475,61 +483,127 @@ class FDMMesh():
                 return True
             
         return False
-
+    
     def update(self):
         for i, ind in enumerate(self.free_ind):
             self.verts[ind, :] = self.new_x[i, :]
+    
+    #### AUTOMATIC OPTIMIZATION
 
-class FDMModel():
-    def __init__(self, points, q = 10):
-        C = np.zeros((1, len(points)))
+    def create_q_optimized_model(self):
+        def objective(qs):
+            self.solve_FDMModel(qs)
+            self.update()
+            return self.sum_FL()
+            
+        x0 = [2, 40]
+        
+        # data = []
 
-        self.fixed = []
-        self.free = []
+        # for q_gen in range(1, 30, 2):
+        #     for q_rib in range(q_gen, 30, 2):
+        #         datum = [q_gen, q_rib, objective([q_gen, q_rib])]
+        #         data.append(datum)
+        #         print(datum)
 
-        x_fixed = [[], [], []]
-        x_free = [[], [], []]
+        # fig, ax = plt.subplots(subplot_kw={"projection": "3d", "autoscale_on": "True"})
+        # mpl.rcParams['axes3d.mouserotationstyle'] = 'azel'
 
-        for i, startpt in enumerate(points):
-            for endpt in startpt.connected:
-                newrow = np.zeros((1, len(points)))
-                newrow[0, startpt.index] = 1
-                newrow[0, endpt.index] = -1
-                C = np.vstack([C, newrow])
+        # ax.set(
+        #     xlabel = "q_gen",
+        #     ylabel = "q_rib"
+        # )
 
-            if startpt.condition == "free":
-                self.free.append(i)
-                x_free[0].append(startpt.x)
-                x_free[1].append(startpt.y)
-                x_free[2].append(startpt.z)
-            else:
-                self.fixed.append(i)
-                x_fixed[0].append(startpt.x)
-                x_fixed[1].append(startpt.y)
-                x_fixed[2].append(startpt.z)
+        # ax.scatter(
+        #     [datum[0] for datum in data],
+        #     [datum[1] for datum in data],
+        #     [datum[2] for datum in data],
+        #     cmap = "berlin"
+        # )
+        
+        # plt.show()
 
-        C = C[1:, :] # connectivity matrix
+        method = "COBYLA"
+        bounds = ((0.1, 200), (0.1, 200))
+        cstr = opt.LinearConstraint(
+            A = [1, -1],
+            ub = -1,
+            keep_feasible = True
+        )
 
-        C_fixed = C[:, self.fixed]
-        C_free = C[:, self.free]
+        result = opt.minimize(
+            objective,
+            x0,
+            method = method,
+            bounds = bounds,
+            constraints = cstr
+        )
 
-        Q =  np.diag([q]*C_free.shape[0])
-        p = np.array([[0, 0, 9.8] for i in range(len(self.free))])
+        print(result)
+        print(result.x)
 
-        Dn = C_free.T @ Q @ C_free
-        Df = C_free.T @ Q @ C_fixed
+        self.q_gen, self.q_rib = result.x
 
-        x_fixed = np.array(x_fixed).T
-        x_free = np.array(x_free).T
+        self.solve_FDMModel(result.x)
 
-        self.new_x = np.linalg.solve(Dn, p - Df @ x_fixed)
+        self.update()
 
-    def update(self, points):
-        for i, point_ind in enumerate(self.free):
-            point = points[point_ind]
-            point.x = self.new_x[i, 0]
-            point.y = self.new_x[i, 1]
-            point.z = self.new_x[i, 2]
+        self.plot()
+    
+    #### STATISTICS FOR OBJECTIVES
+
+    def tri_area(self, face, project = True):
+        """
+        Calculates the area of a triangular face. If project = True, projects the face to
+        the xy plane before calculating the area.
+        """
+
+        AB = self.verts[face[0], :] - self.verts[face[1], :]
+        AC = self.verts[face[0], :] - self.verts[face[2], :]
+
+        if project:
+            AB[2] = 0
+            AC[2] = 0
+
+        return 0.5 * np.linalg.norm(np.cross(AB, AC))
+    
+    def total_area(self, project = True):
+        """
+        Returns the total area of the structure. If project is true,
+        it's the covered area on the xy-plane. Else, it's the surface area.
+        """
+
+        return sum(self.tri_area(face, project) for face in self.faces)
+    
+    def sum_FL(self):
+        """
+        Returns sum of force times length of mesh members as an analog
+        for structural weight.
+        """
+        ans = 0
+
+        for edge in self.rib_edges:
+            length = np.linalg.norm(self.verts[edge[0]] - self.verts[edge[1]])
+            ans += self.q_rib * length * length
+
+        for edge in self.free_edges:
+            length = np.linalg.norm(self.verts[edge[0]] - self.verts[edge[1]])
+            ans += self.q_gen * length * length
+
+        return ans
+    
+    def support_reactions(self):
+        """
+        Returns the sum of the magnitudes of the forces going to the supports.
+        Supports are fixed vertices.
+        """
+        ans = 0
+
+        for edge, q in self.support_edges:
+            length = np.linalg.norm(self.verts[edge[0]] - self.verts[edge[1]])
+            ans += length * (self.q_gen if q == "gen" else self.q_rib)
+
+        return ans
 
 root = Tk()
 root.geometry('500x400')
@@ -546,6 +620,9 @@ root.bind("<Command-KeyPress-c>", ex.create_mesh)
 root.bind("<Command-KeyPress-s>", ex.simulate_model)
 root.bind("<Command-KeyPress-u>", ex.update_model)
 root.bind("<Command-KeyPress-p>", ex.plot)
+
+root.bind("<Command-KeyPress-a>", ex.csu)
+root.bind("<Command-KeyPress-o>", ex.opt_q)
 
 while True:
     ex.draw()
