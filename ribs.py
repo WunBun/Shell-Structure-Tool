@@ -2,6 +2,8 @@ from tkinter import *
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+mpl.use('TkAgg')
+
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from meshlib import mrmeshpy as mm
@@ -97,9 +99,39 @@ class ScreenSpace(Frame):
 
         self.last_added = None
 
-        self.epsilon = 5
+        self.state = "add" # states: add, select
+        self.selected = None
+
+        self.epsilon = 10
 
         self.model = FDMMesh()
+
+    def add_mode(self, event):
+        self.state = "add"
+        self.selected = None
+    
+    def select_mode(self, event):
+        self.state = "select"
+
+    def click(self, event):
+        if self.state == "add":
+            self.add_point(event)
+        elif self.state == "select":
+            self.select_point(event)
+
+    def shift_click(self, event):
+        if self.state == "add":
+            self.add_chain(event)
+        elif self.state == "select":
+            self.relocate_selected_point(event)
+
+    def delete(self, event):
+        print("delete")
+
+        if self.state == "add":
+            pass
+        elif self.state == "select":
+            self.delete_selected()
 
     def clear(self, event):
         self.points = [] # empty out the objects
@@ -113,6 +145,13 @@ class ScreenSpace(Frame):
     def draw(self):
         self.canvas.delete("all") # clear the canvas
 
+        self.canvas.create_text(
+            25, 25,
+            text = f"Mode: {self.state}",
+            anchor = NW,
+            font = ("Calibri 16 bold")
+        )
+
         for point in self.points:
             self.canvas.create_oval(point.x - point.radius, point.y - point.radius,
                                     point.x + point.radius, point.y + point.radius,
@@ -124,6 +163,10 @@ class ScreenSpace(Frame):
                                         other.x, other.y,
                                         fill = '#fff',
                                         width = 0.5)
+        if self.selected:
+            self.canvas.create_oval(self.selected.x - self.selected.radius, self.selected.y - self.selected.radius,
+                                    self.selected.x + self.selected.radius, self.selected.y + self.selected.radius,
+                                    outline = "#f00", fill = "#f00", width = self.selected.z/2)
                 
     def snap(self, event):
         event_pt = Point(event.x, event.y, 0, "fixed", index = len(self.points))
@@ -195,12 +238,53 @@ class ScreenSpace(Frame):
             self.last_added = newpt
         else:
             startpt.connected.add(newpt)
+            newpt.connected.add(startpt)
             
             self.lines.append(Line(startpt, newpt))
 
             if newpt not in self.points:
                 self.points.append(newpt)
             self.last_added = newpt
+
+    def select_point(self, event):
+        event_pt = Point(event.x, event.y, 0, "fixed", index = len(self.points))
+
+        min_dist = float("inf")
+        min_pt = None
+
+        # closest point?
+        if self.points:
+            for point in self.points:
+                dist = point.plane_distance(event_pt)
+                if dist < min_dist:
+                    min_dist = dist
+                    min_pt = point
+
+        if min_dist < self.epsilon:
+            self.selected = min_pt
+
+        print(self.selected)
+
+    def relocate_selected_point(self, event):
+        if self.selected:
+            self.selected.x = event.x
+            self.selected.y = event.y
+
+    def delete_selected(self):
+        if not self.selected:
+            return
+        
+        self.points.remove(self.selected)
+
+        for line in self.lines:
+            if line.pstart == self.selected or line.pend == self.selected:
+                self.lines.remove(line)
+
+        for point in self.points:
+            if self.selected in point.connected:
+                point.connected.remove(self.selected)
+
+        self.selected = None
 
     def dump(self, event):
         print(self.points)
@@ -240,7 +324,7 @@ class ScreenSpace(Frame):
 
 class FDMMesh():
     def __init__(self, points = None, lines = None):
-        self.epsilon = 10e-2
+        self.epsilon = 2 * 10e-1
 
         if not points or not lines:
             return
@@ -289,20 +373,10 @@ class FDMMesh():
         self.free_edges = None
         self.rib_edges = None
 
+        self.q_gen = 0
+        self.q_rib = 0
+
         self.FDM_invariants()
-
-    def count_edges(self, faces, list_edges = False):
-        edges = set()
-
-        for face in faces:
-            for i in range(3):
-                if (face[i], face[(i + 1) % 3]) not in edges and (face[(i + 1) % 3], face[i]) not in edges:
-                    edges.add((face[i], face[(i + 1) % 3]))
-
-        if list_edges:
-            return edges, len(edges)
-        
-        return len(edges)
 
     def plot(self):
         fig, ax = plt.subplots(subplot_kw={"projection": "3d", "autoscale_on": "True"})
@@ -347,36 +421,40 @@ class FDMMesh():
         
         ax.add_collection3d(poly)
 
-        if not self.free_edges:
-            for face in self.faces:
-                for i in range(3):
-                    ax.plot(
-                        [self.verts[face[i]][0], self.verts[face[(i + 1)%3]][0]],
-                        [self.verts[face[i]][1], self.verts[face[(i + 1)%3]][1]],
-                        [self.verts[face[i]][2], self.verts[face[(i + 1)%3]][2]],
-                        # zorder = 1
-                    )
-        else:
-            for edge in self.free_edges:
-                ax.plot(
-                        [self.verts[edge[0]][0], self.verts[edge[1]][0]],
-                        [self.verts[edge[0]][1], self.verts[edge[1]][1]],
-                        [self.verts[edge[0]][2], self.verts[edge[1]][2]],
-                        "g-",
-                        linewidth = 0.5,
-                        # zorder = 2
-                    )
-            for edge in self.rib_edges:
-                ax.plot(
-                        [self.verts[edge[0]][0], self.verts[edge[1]][0]],
-                        [self.verts[edge[0]][1], self.verts[edge[1]][1]],
-                        [self.verts[edge[0]][2], self.verts[edge[1]][2]],
-                        "k-",
-                        linewidth = 1,
-                        # zorder = 3
-                    )
+        for edge in self.free_edges:
+            ax.plot(
+                    [self.verts[edge[0]][0], self.verts[edge[1]][0]],
+                    [self.verts[edge[0]][1], self.verts[edge[1]][1]],
+                    [self.verts[edge[0]][2], self.verts[edge[1]][2]],
+                    "g-",
+                    linewidth = 0.5,
+                    # zorder = 2
+                )
+        for edge in self.rib_edges:
+            ax.plot(
+                    [self.verts[edge[0]][0], self.verts[edge[1]][0]],
+                    [self.verts[edge[0]][1], self.verts[edge[1]][1]],
+                    [self.verts[edge[0]][2], self.verts[edge[1]][2]],
+                    "k-",
+                    linewidth = 1,
+                    # zorder = 3
+                )
 
         plt.show()
+        plt.close()
+
+    def count_edges(self, faces, list_edges = False):
+        edges = set()
+
+        for face in faces:
+            for i in range(3):
+                if (face[i], face[(i + 1) % 3]) not in edges and (face[(i + 1) % 3], face[i]) not in edges:
+                    edges.add((face[i], face[(i + 1) % 3]))
+
+        if list_edges:
+            return edges, len(edges)
+        
+        return len(edges)
 
     def FDM_invariants(self):
         self.orig_fixed = [p for p in self.base_points if p.condition == "fixed"]
@@ -439,6 +517,10 @@ class FDMMesh():
                 newrow[0, face[(i+1) % 3]] = -1
                 self.C = np.vstack([self.C, newrow])
 
+        # print(f"{self.ribs =}")
+        # print(f"{self.rib_edges =}")
+        # print(f"{self.free_edges =}")
+
     def solve_FDMModel(self, qs = (2, 40)):
         # force densities
         self.q_gen = qs[0]
@@ -500,8 +582,8 @@ class FDMMesh():
         
         # data = []
 
-        # for q_gen in range(1, 30, 2):
-        #     for q_rib in range(q_gen, 30, 2):
+        # for q_gen in np.arange(0.1, 5, 0.1):
+        #     for q_rib in np.arange(q_gen, 20, 0.5):
         #         datum = [q_gen, q_rib, objective([q_gen, q_rib])]
         #         data.append(datum)
         #         print(datum)
@@ -538,6 +620,8 @@ class FDMMesh():
             bounds = bounds,
             constraints = cstr
         )
+
+        # why would we run out of iterations without converging :((((
 
         print(result)
         print(result.x)
@@ -610,8 +694,14 @@ root.geometry('500x400')
 
 ex = ScreenSpace()
 
-root.bind("<Button-1>", ex.add_point)
-root.bind("<Shift-Button-1>", ex.add_chain)
+root.bind("<Button-1>", ex.click)
+root.bind("<Shift-Button-1>", ex.shift_click)
+root.bind("<KeyPress-BackSpace>", ex.delete)
+root.bind("<KeyPress-Delete>", ex.delete)
+
+root.bind("<KeyPress-a>", ex.add_mode)
+root.bind("<KeyPress-s>", ex.select_mode)
+
 root.bind("<Command-KeyPress-d>", ex.clear)
 root.bind("<KeyPress-p>", ex.dump)
 root.bind("<KeyPress-l>", ex.add_labels)
